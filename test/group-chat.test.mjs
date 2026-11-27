@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { setTimeout as pause } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { memberAccessModes } from '../wecom-codex/runtime/model-settings.mjs';
 
 const sdk = `
@@ -122,7 +123,8 @@ test('enabled groups keep their own Codex threads and receive only their own res
       botId: 'test', workspace: home, owner: 'paired', thread: 'existing-private', seen: [], notices: [],
     })),
   ]);
-  const child = spawn(process.execPath, ['--import', join(home, 'test-clock.mjs'), join(home, 'runtime', 'bridge.mjs')], {
+  const child = spawn(process.execPath, ['--import', pathToFileURL(join(home, 'test-clock.mjs')).href,
+    join(home, 'runtime', 'bridge.mjs')], {
     env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const exited = once(child, 'exit');
