@@ -65,7 +65,7 @@ test('desktop settings save access, models, reply style and local notices', asyn
     const request = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } };
     const child = spawnSync(process.execPath, [server], {
       input: JSON.stringify(request) + '\n', encoding: 'utf8', timeout: 5_000,
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home },
     });
     assert.equal(child.status, 0, child.stderr || child.error?.message);
     return JSON.parse(child.stdout).result;
@@ -80,7 +80,8 @@ test('desktop settings save access, models, reply style and local notices', asyn
     assert.equal(call('wecom.settings.read').structuredContent.values.memberAccess, memberAccess);
   }
   assert.equal(call('wecom.settings.update', { set: { memberAccess: 'unknown' } }).isError, true);
-  const path = join(home, 'Library', 'Application Support', 'WeCom Codex', 'model.json');
+  const dataParent = process.platform === 'win32' ? home : join(home, 'Library', 'Application Support');
+  const path = join(dataParent, 'WeCom Codex', 'model.json');
   await assert.rejects(readFile(path), { code: 'ENOENT' });
   const update = call('wecom.settings.update', { set: { model: 'test-model' } });
   assert.equal(update.structuredContent.values.memberAccess, memberAccessModes.all);

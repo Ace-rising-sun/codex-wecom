@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { request } from 'node:http';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
@@ -31,8 +33,7 @@ const sdk = `
   }
 `;
 
-const appServer = `#!/usr/bin/env node
-  const { createInterface } = require('node:readline');
+const appServer = `  const { createInterface } = require('node:readline');
   const { randomUUID } = require('node:crypto');
   const { existsSync, writeFileSync } = require('node:fs');
   const send = value => console.log(JSON.stringify(value));
@@ -68,11 +69,17 @@ const appServer = `#!/usr/bin/env node
 `;
 
 test('enabled groups keep their own Codex threads and receive only their own results', { timeout: 15_000 }, async t => {
-  const home = await realpath(await mkdtemp('/tmp/wx-test-'));
-  t.after(() => rm(home, { recursive: true, force: true }));
-  const dataDir = join(home, 'Library', 'Application Support', 'WeCom Codex');
+  const windows = process.platform === 'win32';
+  const home = await realpath(await mkdtemp(join(windows ? tmpdir() : '/tmp', 'wx-test-')));
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 4 }));
+  const parent = windows ? home : join(home, 'Library', 'Application Support');
+  const dataDir = join(parent, 'WeCom Codex');
+  const controlKey = 'a'.repeat(64);
+  const socketPath = windows
+    ? '\\\\.\\pipe\\wecom-codex-' + createHash('sha256').update(dataDir.toLowerCase()).digest('hex').slice(0, 32)
+    : join(dataDir, 'control.sock');
   const sdkDir = join(home, 'node_modules', '@wecom', 'aibot-node-sdk');
-  const codex = join(home, 'codex');
+  const codex = join(home, 'codex.cjs');
   const stateFile = join(dataDir, 'state.json');
   await Promise.all([mkdir(dataDir, { recursive: true }), mkdir(sdkDir, { recursive: true })]);
   await Promise.all([
@@ -80,13 +87,13 @@ test('enabled groups keep their own Codex threads and receive only their own res
     writeFile(codex, appServer, { mode: 0o700 }),
     writeFile(join(sdkDir, 'package.json'), JSON.stringify({ exports: './index.mjs' })),
     writeFile(join(sdkDir, 'index.mjs'), sdk),
-    writeFile(join(dataDir, 'config.json'), JSON.stringify({ botId: 'test', secret: 'fixture-only', workspace: home, codex })),
+    writeFile(join(dataDir, 'config.json'), JSON.stringify({ botId: 'test', secret: 'fixture-only', workspace: home, codex, controlKey })),
     writeFile(stateFile, JSON.stringify({
       botId: 'test', workspace: home, owner: 'paired', thread: 'existing-private', seen: [], notices: [],
     })),
   ]);
   const child = spawn(process.execPath, [join(home, 'runtime', 'bridge.mjs')], {
-    env: { ...process.env, HOME: home }, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const exited = once(child, 'exit');
   let stderr = '';
@@ -121,9 +128,10 @@ test('enabled groups keep their own Codex threads and receive only their own res
   const setAccess = mode => writeFile(join(dataDir, 'member-access.json'), JSON.stringify(mode));
   const setPreferences = (persona, localNotices) =>
     writeFile(join(dataDir, 'preferences.json'), JSON.stringify({ persona, localNotices }));
-  function hook(turnId, sessionId = 'local-desktop-thread') {
+  function hook(turnId, sessionId = 'local-desktop-thread', authenticated = true) {
     return new Promise((resolve, reject) => {
-      const client = request({ socketPath: join(dataDir, 'control.sock'), path: '/hook', method: 'POST' }, response => {
+      const headers = windows && authenticated ? { Authorization: `Bearer ${controlKey}` } : {};
+      const client = request({ socketPath, path: '/hook', method: 'POST', headers }, response => {
         let body = '';
         response.setEncoding('utf8').on('data', chunk => { body += chunk; });
         response.once('end', () => resolve(JSON.parse(body)));
@@ -135,6 +143,7 @@ test('enabled groups keep their own Codex threads and receive only their own res
 
   try {
     await waitFor(event => event.type === 'ready');
+    if (windows) assert.deepEqual(await hook('no-token', 'local-desktop-thread', false), { error: '本机连接未授权' });
     send('unauthorized-enable', '@机器人 /group-on', 'group-a', 'other');
     assert.match(await command('before', '@机器人 /ping', 'group-a'), /尚未启用/);
     assert.match(await command('enable-a', '@机器人 /group-on', 'group-a'), /本群已启用/);

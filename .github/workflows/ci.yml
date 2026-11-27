@@ -7,9 +7,10 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [macos-15, windows-2025]
         node: ['22.x', '24.x']
     steps:
       - uses: actions/checkout@v6
@@ -18,6 +19,11 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
-      - run: sh -n install.sh
+      - if: runner.os == 'macOS'
+        run: sh -n install.sh
+      - run: node --check install.mjs
       - run: npm ci --prefix wecom-codex --omit=dev --ignore-scripts --no-audit --no-fund
-      - run: node --test test/*.test.mjs
+      - run: npm install --global @openai/codex@0.170.0
+      - run: node --test
+        env:
+          WE_COM_TEST_CODEX: "1"
