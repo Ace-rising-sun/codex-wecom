@@ -37,9 +37,23 @@ const appServer = `  const { createInterface } = require('node:readline');
   const { randomUUID } = require('node:crypto');
   const { existsSync, writeFileSync } = require('node:fs');
   const send = value => console.log(JSON.stringify(value));
+  const turns = new Map();
+  const approvals = new Map();
   createInterface({ input: process.stdin }).on('line', line => {
-    const { id, method, params } = JSON.parse(line);
+    const { id, method, params, result } = JSON.parse(line);
     if (id === undefined) return;
+    if (!method && approvals.has(id)) {
+      const turn = approvals.get(id);
+      approvals.delete(id);
+      if (turns.has(turn.turnId)) turn.finish('completed', result.decision + ' ' + turn.name);
+      return;
+    }
+    if (method === 'turn/interrupt') {
+      const turn = turns.get(params.turnId);
+      if (!turn || turn.threadId !== params.threadId) return send({ id, error: { code: -1 } });
+      send({ id, result: {} });
+      return turn.finish('interrupted');
+    }
     if (method === 'thread/start') return send({ id, result: { thread: { id: randomUUID() } } });
     if (method === 'thread/read') return send({ id, result: { thread: { name: '插件设置优化' } } });
     if (method === 'thread/items/list') return send({ id, result: { data: [
@@ -50,20 +64,31 @@ const appServer = `  const { createInterface } = require('node:readline');
     if (method !== 'turn/start') return send({ id, result: {} });
     writeFileSync('last-turn-context.json', JSON.stringify(params.additionalContext));
     const { threadId, input } = params;
+    const name = input[0].text;
     const turnId = randomUUID();
-    send({ id, result: { turn: { id: turnId } } });
-    const finish = () => {
-      send({ method: 'item/completed', params: {
-        threadId, turnId, item: { type: 'agentMessage', text: threadId + ' ' + input[0].text }
-      } });
-      send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
-    };
-    if (input[0].text !== '占住队列') return finish();
-    const timer = setInterval(() => {
-      if (existsSync('release-queue')) {
-        clearInterval(timer);
-        finish();
+    let timer;
+    const finish = (status = 'completed', output = threadId + ' ' + name) => {
+      clearInterval(timer);
+      turns.delete(turnId);
+      approvals.delete('approve-' + turnId);
+      if (status === 'completed') {
+        send({ method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: output } } });
       }
+      send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status } } });
+    };
+    turns.set(turnId, { threadId, turnId, name, finish });
+    send({ id, result: { turn: { id: turnId } } });
+    send({ method: 'turn/started', params: { threadId, turn: { id: turnId } } });
+    if (name.startsWith('approve-')) {
+      const approvalId = 'approve-' + turnId;
+      approvals.set(approvalId, turns.get(turnId));
+      return send({ id: approvalId, method: 'item/commandExecution/requestApproval',
+        params: { threadId, turnId, command: name } });
+    }
+    if (!name.startsWith('hold-')) return finish();
+    writeFileSync('started-' + name, threadId);
+    timer = setInterval(() => {
+      if (existsSync('release-' + name)) finish();
     }, 10);
   });
 `;
@@ -87,12 +112,17 @@ test('enabled groups keep their own Codex threads and receive only their own res
     writeFile(codex, appServer, { mode: 0o700 }),
     writeFile(join(sdkDir, 'package.json'), JSON.stringify({ exports: './index.mjs' })),
     writeFile(join(sdkDir, 'index.mjs'), sdk),
+    writeFile(join(home, 'test-clock.mjs'), `
+      const set = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, delay, ...args) =>
+        set(callback, delay === 60_000 || delay === 180_000 ? 250 : delay, ...args);
+    `),
     writeFile(join(dataDir, 'config.json'), JSON.stringify({ botId: 'test', secret: 'fixture-only', workspace: home, codex, controlKey })),
     writeFile(stateFile, JSON.stringify({
       botId: 'test', workspace: home, owner: 'paired', thread: 'existing-private', seen: [], notices: [],
     })),
   ]);
-  const child = spawn(process.execPath, [join(home, 'runtime', 'bridge.mjs')], {
+  const child = spawn(process.execPath, ['--import', join(home, 'test-clock.mjs'), join(home, 'runtime', 'bridge.mjs')], {
     env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const exited = once(child, 'exit');
@@ -126,8 +156,19 @@ test('enabled groups keep their own Codex threads and receive only their own res
     return event.text.slice(0, -expected.length - 1);
   }
   const setAccess = mode => writeFile(join(dataDir, 'member-access.json'), JSON.stringify(mode));
-  const setPreferences = (persona, localNotices) =>
-    writeFile(join(dataDir, 'preferences.json'), JSON.stringify({ persona, localNotices }));
+  const setPreferences = (persona, localNotices, taskTimeoutMinutes = 0) =>
+    writeFile(join(dataDir, 'preferences.json'), JSON.stringify({ persona, localNotices, taskTimeoutMinutes }));
+  async function waitStarted(name) {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const id = await readFile(join(home, 'started-' + name), 'utf8').catch(error => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+      if (id) return id;
+      await pause(10);
+    }
+    assert.fail(`Turn ${name} did not start`);
+  }
+  const release = name => writeFile(join(home, 'release-' + name), '');
   function hook(turnId, sessionId = 'local-desktop-thread', authenticated = true) {
     return new Promise((resolve, reject) => {
       const headers = windows && authenticated ? { Authorization: `Bearer ${controlKey}` } : {};
@@ -179,10 +220,58 @@ test('enabled groups keep their own Codex threads and receive only their own res
     assert.notEqual(guest, second);
     assert.equal(await result('guest-dm-next', '私聊续接', '私聊续接', undefined, 'other'), guest);
     assert.match(await command('guest-approve', '/approve 123456', undefined, 'other'), /配对账号/);
-    assert.match(await command('occupy-queue', '占住队列'), /正在处理/);
+    // An independent chat starts immediately. The same chat and the third chat remain queued.
+    assert.match(await command('parallel-private', 'hold-private'), /正在处理/);
+    assert.equal(await waitStarted('hold-private'), 'existing-private');
+    assert.match(await command('parallel-group', '@机器人 hold-group', 'group-b'), /按顺序处理/);
+    assert.equal(await waitStarted('hold-group'), threadB);
+    assert.match(await command('same-group-next', '@机器人 同群下一条', 'group-b'), /按顺序处理/);
+    send('third-chat', '第三个会话', undefined, 'second');
+    assert.match(await command('third-chat-status', '/status', undefined, 'second'), /空闲，等待任务 1 个/);
+    assert.ok(events.every(event => !event.text?.endsWith('同群下一条') && !event.text?.endsWith('第三个会话')));
+    assert.match(await command('group-stop', '@机器人 /stop', 'group-b'), /已请求停止/);
+    await waitFor(event => event.type === 'message' && event.to === 'group-b' && event.text === '任务已停止。');
+    await waitFor(event => event.type === 'message' && event.to === 'group-b' && event.text.endsWith('同群下一条'));
+    await waitFor(event => event.type === 'message' && event.to === 'second' && event.text.endsWith('第三个会话'));
+    assert.match(await command('private-still-running', '/status'), /本会话正在运行/);
+    await release('hold-private');
+    await waitFor(event => event.type === 'message' && event.to === 'paired' && event.text.endsWith('hold-private'));
+
+    // Approval codes stay bound to their own turns even when both are waiting for approval.
+    send('private-approval', 'approve-private');
+    send('group-approval', '@机器人 approve-group', 'group-b');
+    const codeFor = async name => {
+      const event = await waitFor(item => item.type === 'message' && item.to === 'paired' &&
+        item.text.includes('等待批准') && item.text.includes(name));
+      return event.text.match(/\/approve (\d{6})/u)[1];
+    };
+    const [privateCode, groupCode] = await Promise.all([codeFor('approve-private'), codeFor('approve-group')]);
+    assert.notEqual(privateCode, groupCode);
+    assert.match(await command('decline-group', '/reject ' + groupCode), /已记录/);
+    await waitFor(event => event.type === 'message' && event.to === 'group-b' && event.text === 'decline approve-group');
+    assert.match(await command('approve-private', '/approve ' + privateCode), /已记录/);
+    await waitFor(event => event.type === 'message' && event.to === 'paired' && event.text === 'accept approve-private');
+
+    // Only future turns use a new limit; a timed-out group leaves the unlimited private turn running.
+    const ordinary = { style: 'default', instructions: '' };
+    assert.match(await command('no-limit', 'hold-unlimited'), /正在处理/);
+    await waitStarted('hold-unlimited');
+    await setPreferences(ordinary, true, 1);
+    send('limited', '@机器人 hold-limited', 'group-b');
+    await waitStarted('hold-limited');
+    await waitFor(event => event.type === 'message' && event.to === 'group-b' &&
+      event.text === '本轮达到设置的 1 分钟执行时限，已停止。');
+    assert.match(await command('unlimited-still-running', '/status'), /本会话正在运行/);
+    await release('hold-unlimited');
+    await waitFor(event => event.type === 'message' && event.to === 'paired' && event.text.endsWith('hold-unlimited'));
+    await setPreferences(ordinary, true);
+
+    assert.match(await command('occupy-private', 'hold-revoke-owner'), /正在处理/);
+    assert.match(await command('occupy-second', 'hold-revoke-second', undefined, 'second'), /正在处理/);
+    await Promise.all([waitStarted('hold-revoke-owner'), waitStarted('hold-revoke-second')]);
     assert.match(await command('queued-guest', '@机器人 排队时被收回权限', 'group-b', 'other'), /按顺序处理/);
     await setAccess(memberAccessModes.owner);
-    await writeFile(join(home, 'release-queue'), '');
+    await Promise.all([release('hold-revoke-owner'), release('hold-revoke-second')]);
     send('unauthorized-revoked-group', '@机器人 权限收回后群聊', 'group-b', 'other');
     send('unauthorized-revoked-dm', '权限收回后私聊', undefined, 'other');
     assert.equal(await result('owner-still-allowed', '本人权限仍有效', '本人权限仍有效'), 'existing-private');
