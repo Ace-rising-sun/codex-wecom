@@ -47,7 +47,7 @@ test('real Codex registers the plugin and loads the installed settings server', 
 
     const listed = codexJson(['plugin','list','--marketplace','wecom-local','--json']);
     const installed = listed.installed.find(row => row.pluginId === 'wecom-codex@wecom-local');
-    assert.equal(installed.version, '0.3.0');
+    assert.equal(installed.version, '0.4.0');
     assert.equal(installed.enabled, true);
 
     const cached = join(process.env.CODEX_HOME, 'plugins', 'cache', 'wecom-local', 'wecom-codex', installed.version);

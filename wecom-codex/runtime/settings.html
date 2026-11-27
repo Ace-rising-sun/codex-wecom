@@ -33,6 +33,16 @@
       <button id="model-save" disabled>保存模型</button>
       <output id="model-status" aria-live="polite"></output>
     </form>
+    <form id="execution-form">
+      <h2>任务执行</h2>
+      <label class="switch">限制单轮执行时间<input id="task-timeout-enabled" type="checkbox" role="switch"></label>
+      <label id="task-timeout-field" hidden>执行时限（分钟）
+        <input id="task-timeout-minutes" type="number" min="1" step="1" value="30" disabled>
+      </label>
+      <p>默认不限时。开启后从任务实际开始时计时，排队时间不计入。保存后对接下来开始的任务生效。</p>
+      <button id="execution-save" disabled>保存任务执行设置</button>
+      <output id="execution-status" aria-live="polite"></output>
+    </form>
     <form id="preferences-form">
       <h2>回复与通知</h2>
       <label>机器人人设<select id="persona-style" required></select></label>
@@ -104,6 +114,12 @@
       }
       element('model').value = info.values.model;
       element('effort').value = info.values.reasoningEffort;
+      const timeout = info.values.taskTimeoutMinutes;
+      element('task-timeout-enabled').checked = timeout > 0;
+      element('task-timeout-minutes').value = timeout || 30;
+      element('task-timeout-minutes').max = info.schema.properties.taskTimeoutMinutes.maximum;
+      showTaskTimeout();
+      element('execution-save').disabled = false;
       const persona = info.schema.properties.persona.properties;
       for (const option of persona.style.oneOf) {
         element('persona-style').append(new Option(option.title, option.const));
@@ -129,6 +145,16 @@
     }
 
     element('persona-style').addEventListener('change', showCustomPersona);
+
+    function showTaskTimeout() {
+      const enabled = element('task-timeout-enabled').checked;
+      const minutes = element('task-timeout-minutes');
+      element('task-timeout-field').hidden = !enabled;
+      minutes.disabled = !enabled;
+      minutes.required = enabled;
+    }
+
+    element('task-timeout-enabled').addEventListener('change', showTaskTimeout);
 
     async function loadBot({ setFields = true } = {}) {
       credentialKey = await tool('wecom.settings.botRead');
@@ -161,6 +187,20 @@
       try {
         await tool('wecom.settings.update', { set: { model: element('model').value.trim(), reasoningEffort: element('effort').value } });
         status.textContent = '模型已保存，下次企微任务生效。';
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+
+    element('execution-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element('execution-save');
+      const status = element('execution-status');
+      const minutes = element('task-timeout-enabled').checked ? element('task-timeout-minutes').valueAsNumber : 0;
+      button.disabled = true;
+      status.textContent = '正在保存…';
+      try {
+        await tool('wecom.settings.update', { set: { taskTimeoutMinutes: minutes } });
+        status.textContent = minutes ? `后续任务的执行时限为 ${minutes} 分钟。` : '后续任务不限时。';
       } catch (error) { status.textContent = error.message; }
       finally { button.disabled = false; }
     });
@@ -222,6 +262,7 @@
           return Promise.all([
             loadSettings().catch(error => {
               element('model-status').textContent = error.message;
+              element('execution-status').textContent = error.message;
               element('preferences-status').textContent = error.message;
               element('access-status').textContent = error.message;
             }),

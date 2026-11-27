@@ -49,7 +49,7 @@ test('the settings server supports modern discovery and legacy initialization', 
   const resource = replies.find(reply => reply.id === 4).result.contents[0];
   assert.equal(resource.uri, launcher._meta.ui.resourceUri);
   assert.equal(resource.uri, launcher._meta['openai/outputTemplate']);
-  for (const form of ['model-form', 'preferences-form', 'access-form', 'bot-form']) {
+  for (const form of ['model-form', 'execution-form', 'preferences-form', 'access-form', 'bot-form']) {
     assert.ok(resource.text.includes(`id="${form}"`));
   }
   const historyResource = replies.find(reply => reply.id === 6).result.contents[0];
@@ -87,6 +87,7 @@ test('desktop settings save access, models, reply style and local notices', asyn
   assert.equal(update.structuredContent.values.memberAccess, memberAccessModes.all);
   assert.equal(update.structuredContent.values.model, 'test-model');
   assert.equal(initial.values.localNotices, true);
+  assert.equal(initial.values.taskTimeoutMinutes, 0);
   assert.deepEqual(initial.schema.properties.persona.properties.style.oneOf.map(choice => choice.const),
     ['default', 'professional', 'friendly', 'custom']);
   const persona = { style: 'custom', instructions: '先说结果，称呼我为搭档。' };
@@ -97,4 +98,9 @@ test('desktop settings save access, models, reply style and local notices', asyn
   assert.equal(call('wecom.settings.update', { set: { persona: { style: 'custom', instructions: '   ' } } }).isError, true);
   assert.equal(call('wecom.settings.update', { set: { localNotices: 'false' } }).isError, true);
   assert.deepEqual(call('wecom.settings.read').structuredContent.values, preferences);
+  const timeout = minutes => call('wecom.settings.update', { set: { taskTimeoutMinutes: minutes } });
+  for (const invalid of [-1, 0.5, '30', 1441]) assert.equal(timeout(invalid).isError, true);
+  assert.deepEqual(timeout(30).structuredContent.values, { ...preferences, taskTimeoutMinutes: 30 });
+  assert.equal(call('wecom.settings.read').structuredContent.values.taskTimeoutMinutes, 30);
+  assert.deepEqual(timeout(0).structuredContent.values, preferences);
 });

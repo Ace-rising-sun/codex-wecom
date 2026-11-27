@@ -19,10 +19,11 @@ export const personaStyles = Object.freeze({
   custom: { label: '自定义' },
 });
 export const personaLimit = 600;
-const defaultPreferences = { persona: { style: 'default', instructions: '' }, localNotices: true };
+export const maxTaskTimeoutMinutes = 1440;
+const defaultPreferences = { persona: { style: 'default', instructions: '' }, localNotices: true, taskTimeoutMinutes: 0 };
 
 function validatePreferences(values) {
-  const { persona, localNotices } = values;
+  const { persona, localNotices, taskTimeoutMinutes = 0 } = values;
   if (!persona || typeof persona.style !== 'string' || !Object.hasOwn(personaStyles, persona.style)
     || typeof persona.instructions !== 'string' || persona.instructions.length > personaLimit) {
     throw new Error('请选择有效的人设，自定义说明最多 600 字。');
@@ -30,7 +31,10 @@ function validatePreferences(values) {
   const instructions = persona.instructions.trim();
   if (persona.style === 'custom' && !instructions) throw new Error('请填写自定义人设。');
   if (typeof localNotices !== 'boolean') throw new Error('请选择是否发送本机会话结束提醒。');
-  return { persona: { style: persona.style, instructions }, localNotices };
+  if (!Number.isInteger(taskTimeoutMinutes) || taskTimeoutMinutes < 0 || taskTimeoutMinutes > maxTaskTimeoutMinutes) {
+    throw new Error(`执行时限需为 1 至 ${maxTaskTimeoutMinutes} 分钟，关闭时设为 0。`);
+  }
+  return { persona: { style: persona.style, instructions }, localNotices, taskTimeoutMinutes };
 }
 
 export async function readPreferences() {

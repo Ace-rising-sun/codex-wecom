@@ -3,10 +3,10 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { configureBot, readBotSettings } from './bot-settings.mjs';
 import { listHistory, openHistoryThread } from './history.mjs';
-import { efforts, memberAccessModes, personaLimit, personaStyles, readMemberAccess, readModelSettings,
+import { efforts, maxTaskTimeoutMinutes, memberAccessModes, personaLimit, personaStyles, readMemberAccess, readModelSettings,
   readPreferences, updateMemberAccess, updateModelSettings, updatePreferences } from './model-settings.mjs';
 
-const serverInfo = { name: 'wecom-settings', version: '0.3.0' };
+const serverInfo = { name: 'wecom-settings', version: '0.4.0' };
 const resourceUri = 'ui://wecom-codex/settings';
 const resource = { uri: resourceUri, name: '企微 Codex 设置', mimeType: 'text/html;profile=mcp-app' };
 const historyUri = 'ui://wecom-codex/history';
@@ -26,6 +26,7 @@ const fields = {
     instructions: { type: 'string', maxLength: personaLimit },
   }), required: ['style', 'instructions'], title: '机器人人设' },
   localNotices: { type: 'boolean', title: '本机会话结束提醒' },
+  taskTimeoutMinutes: { type: 'integer', title: '执行时限（分钟）', minimum: 0, maximum: maxTaskTimeoutMinutes },
 };
 const appOnly = { ui: { visibility: ['app'] } };
 const tools = [
@@ -49,7 +50,7 @@ const tools = [
   },
   {
     name: opener, title: '打开设置',
-    description: '打开 Codex 桌面端的企微配置表单，用于设置模型、回复、通知、使用权限和机器人。',
+    description: '打开 Codex 桌面端的企微配置表单，用于设置模型、执行、回复、通知、使用权限和机器人。',
     inputSchema: object({}),
     annotations: { readOnlyHint: true },
     _meta: {
@@ -145,6 +146,9 @@ async function callTool(name, args) {
         if (Object.hasOwn(changes, 'memberAccess')) {
           if (keys.length !== 1) throw new Error('请单独保存使用权限。');
           await updateMemberAccess(changes.memberAccess);
+        } else if (Object.hasOwn(changes, 'taskTimeoutMinutes')) {
+          if (keys.length !== 1) throw new Error('请单独保存执行时限。');
+          await updatePreferences(changes);
         } else if (keys.some(key => key === 'persona' || key === 'localNotices')) {
           if (keys.some(key => key !== 'persona' && key !== 'localNotices')) throw new Error('请单独保存回复与通知。');
           await updatePreferences(changes);
