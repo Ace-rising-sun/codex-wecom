@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>企微 Codex 设置</title>
+  <style>
+    :root { color-scheme: light dark; font: 14px/1.5 system-ui, sans-serif; }
+    body { margin: 0; color: var(--color-text-primary, CanvasText); background: transparent; }
+    main { box-sizing: border-box; max-width: 640px; margin: auto; padding: 20px; }
+    form { display: grid; gap: 14px; margin: 0 0 22px; }
+    form + form { border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding-top: 18px; }
+    h2 { font-size: 17px; margin: 0; }
+    p { margin: 0; color: var(--color-text-secondary, currentColor); }
+    label { display: grid; gap: 5px; font-weight: 550; }
+    input, select, textarea, button { font: inherit; color: inherit; }
+    input:not([type="checkbox"]), select, textarea { box-sizing: border-box; width: 100%; padding: 8px 10px; border: 1px solid color-mix(in srgb, currentColor 28%, transparent); border-radius: 8px; background: transparent; }
+    textarea { resize: vertical; min-height: 84px; }
+    label[hidden] { display: none; }
+    .switch { grid-template-columns: 1fr auto; align-items: center; }
+    button { justify-self: start; border: 1px solid transparent; border-radius: 8px; padding: 8px 14px; background: var(--color-background-inverse, CanvasText); color: var(--color-text-inverse, Canvas); cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    :focus-visible { outline: 2px solid #1b83ff; outline-offset: 2px; }
+    output { min-height: 20px; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <form id="model-form">
+      <h2>企微 Codex 模型</h2>
+      <label>默认模型<input id="model" required maxlength="128" spellcheck="false"></label>
+      <label>推理强度<select id="effort" required></select></label>
+      <button id="model-save" disabled>保存模型</button>
+      <output id="model-status" aria-live="polite"></output>
+    </form>
+    <form id="preferences-form">
+      <h2>回复与通知</h2>
+      <label>机器人人设<select id="persona-style" required></select></label>
+      <label id="custom-persona" hidden>自定义人设
+        <textarea id="persona-instructions" rows="3" placeholder="例如：称呼我为搭档，先说结果，语气轻松，偶尔用表情。"></textarea>
+      </label>
+      <label class="switch">本机会话结束提醒<input id="local-notices" type="checkbox" role="switch"></label>
+      <button id="preferences-save" disabled>保存回复与通知</button>
+      <output id="preferences-status" aria-live="polite"></output>
+    </form>
+    <form id="access-form">
+      <h2>企微权限</h2>
+      <label>使用权限<select id="member-access" required></select></label>
+      <p>群聊须先由配对账号启用。回复会发回原会话。</p>
+      <button id="access-save" disabled>保存权限</button>
+      <output id="access-status" aria-live="polite"></output>
+    </form>
+    <form id="bot-form">
+      <h2>企微机器人</h2>
+      <label>Bot ID<input id="bot-id" required spellcheck="false" autocomplete="off" maxlength="160"></label>
+      <label>Bot Secret<input id="secret" type="password" autocomplete="new-password" maxlength="200"></label>
+      <label>工作目录<input id="workspace" required spellcheck="false" autocomplete="off" placeholder="本机目录的绝对路径"></label>
+      <button id="bot-save" disabled>保存并连接</button>
+      <output id="bot-status" aria-live="polite"></output>
+    </form>
+  </main>
+  <script>
+    'use strict';
+
+    const element = id => document.getElementById(id);
+    const pending = new Map();
+    let sequence = 0;
+    let credentialKey;
+    const emit = message => window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
+
+    window.addEventListener('message', ({ source, data }) => {
+      if (source !== window.parent || data?.jsonrpc !== '2.0' || !pending.has(data.id)) return;
+      const settle = pending.get(data.id);
+      pending.delete(data.id);
+      settle(data);
+    });
+
+    function request(method, params) {
+      return new Promise((resolve, reject) => {
+        const id = ++sequence;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error('设置请求超时，请重新打开后重试。'));
+        }, 45_000);
+        pending.set(id, message => {
+          clearTimeout(timer);
+          if (message.error) reject(new Error('Codex 无法处理这次设置请求。'));
+          else resolve(message.result);
+        });
+        emit({ id, method, params });
+      });
+    }
+
+    async function tool(name, args = {}) {
+      const result = await request('tools/call', { name, arguments: args });
+      if (result?.isError) throw new Error(result.content?.[0]?.text || '无法保存配置。');
+      return result.structuredContent;
+    }
+
+    async function loadSettings() {
+      const info = await tool('wecom.settings.read');
+      for (const effort of info.schema.properties.reasoningEffort.enum) {
+        element('effort').append(new Option(effort, effort));
+      }
+      element('model').value = info.values.model;
+      element('effort').value = info.values.reasoningEffort;
+      const persona = info.schema.properties.persona.properties;
+      for (const option of persona.style.oneOf) {
+        element('persona-style').append(new Option(option.title, option.const));
+      }
+      element('persona-style').value = info.values.persona.style;
+      element('persona-instructions').value = info.values.persona.instructions;
+      element('persona-instructions').maxLength = persona.instructions.maxLength;
+      element('local-notices').checked = info.values.localNotices;
+      showCustomPersona();
+      for (const access of info.schema.properties.memberAccess.enum) {
+        element('member-access').append(new Option(access, access));
+      }
+      element('member-access').value = info.values.memberAccess;
+      element('model-save').disabled = false;
+      element('preferences-save').disabled = false;
+      element('access-save').disabled = false;
+    }
+
+    function showCustomPersona() {
+      const custom = element('persona-style').value === 'custom';
+      element('custom-persona').hidden = !custom;
+      element('persona-instructions').required = custom;
+    }
+
+    element('persona-style').addEventListener('change', showCustomPersona);
+
+    async function loadBot({ setFields = true } = {}) {
+      credentialKey = await tool('wecom.settings.botRead');
+      if (setFields) {
+        element('bot-id').value = credentialKey.botId;
+        element('workspace').value = credentialKey.workspace;
+      }
+      element('secret').required = !credentialKey.configured;
+      element('secret').placeholder = credentialKey.configured ? '留空可保留现有 Secret' : '输入机器人 Secret';
+      element('bot-save').disabled = false;
+    }
+
+    async function seal(secret) {
+      if (!globalThis.crypto?.subtle) throw new Error('当前界面无法加密 Secret，请重新打开插件设置。');
+      const key = await crypto.subtle.importKey('spki', Uint8Array.from(atob(credentialKey.publicKey), char => char.charCodeAt(0)),
+        { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+      const data = new TextEncoder().encode(secret);
+      try {
+        const encrypted = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, key, data);
+        return btoa(String.fromCharCode(...new Uint8Array(encrypted)));
+      } finally { data.fill(0); }
+    }
+
+    element('model-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element('model-save');
+      const status = element('model-status');
+      button.disabled = true;
+      status.textContent = '正在保存…';
+      try {
+        await tool('wecom.settings.update', { set: { model: element('model').value.trim(), reasoningEffort: element('effort').value } });
+        status.textContent = '模型已保存，下次企微任务生效。';
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+
+    element('access-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element('access-save');
+      const status = element('access-status');
+      button.disabled = true;
+      status.textContent = '正在保存…';
+      try {
+        await tool('wecom.settings.update', { set: { memberAccess: element('member-access').value } });
+        status.textContent = '使用权限已保存。';
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+
+    element('preferences-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element('preferences-save');
+      const status = element('preferences-status');
+      button.disabled = true;
+      status.textContent = '正在保存…';
+      try {
+        await tool('wecom.settings.update', { set: {
+          persona: { style: element('persona-style').value, instructions: element('persona-instructions').value },
+          localNotices: element('local-notices').checked,
+        } });
+        status.textContent = '已保存。';
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+
+    element('bot-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element('bot-save');
+      const status = element('bot-status');
+      button.disabled = true;
+      status.textContent = '正在验证企微长连接…';
+      try {
+        const secretField = element('secret');
+        const secret = secretField.value.trim();
+        secretField.value = '';
+        const result = await tool('wecom.settings.botSave', {
+          botId: element('bot-id').value.trim(), workspace: element('workspace').value.trim(),
+          token: credentialKey.token, ...(secret ? { sealedSecret: await seal(secret) } : {}),
+        });
+        status.textContent = result.paired ? '已连接，原私聊绑定有效。' : `已连接。在企微私聊发送 ${result.pair} 完成配对。`;
+      } catch (error) { status.textContent = error.message; }
+      finally { await loadBot({ setFields: false }).catch(() => { button.disabled = true; }); }
+    });
+
+    if (window.parent !== window) {
+      request('ui/initialize', { appInfo: { name: 'wecom-codex-settings', version: '0.2.0' }, appCapabilities: {}, protocolVersion: '2026-01-26' })
+        .then(() => {
+          emit({ method: 'ui/notifications/initialized' });
+          const notifySize = () => emit({ method: 'ui/notifications/size-changed', params: { height: document.body.scrollHeight } });
+          new ResizeObserver(notifySize).observe(document.body);
+          return Promise.all([
+            loadSettings().catch(error => {
+              element('model-status').textContent = error.message;
+              element('preferences-status').textContent = error.message;
+              element('access-status').textContent = error.message;
+            }),
+            loadBot().catch(error => { element('bot-status').textContent = error.message; }),
+          ]);
+        })
+        .catch(error => { element('bot-status').textContent = error.message; });
+    }
+  </script>
+</body>
+</html>

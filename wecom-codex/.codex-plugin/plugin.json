@@ -1,0 +1,19 @@
+{
+  "name": "wecom-codex",
+  "version": "0.2.15",
+  "description": "通过企微私聊或已启用的群聊使用本机 Codex，并接收任务提醒。",
+  "author": { "name": "Ace" },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "requires_local_executor": true,
+  "hooks": "./hooks/hooks.json",
+  "onboardingSkill": "./skills/wecom-codex-setup/SKILL.md",
+  "interface": {
+    "displayName": "企微 Codex",
+    "shortDescription": "从企微使用 Mac 上的 Codex",
+    "longDescription": "通过企业微信机器人发送任务、继续会话和接收结果，私聊和各个已启用的群聊各自续接。",
+    "developerName": "Ace",
+    "category": "Productivity",
+    "capabilities": ["Interactive"]
+  }
+}

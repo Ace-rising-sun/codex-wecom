@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "wecom-settings": {
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "entry=$1; if [ ! -f \"$entry\" ]; then entry=${CODEX_HOME:-$HOME/.codex}/plugins/cache/wecom-local/wecom-codex/$2/runtime/start-settings.sh; fi; exec /bin/sh \"$entry\"",
+        "wecom-settings",
+        "${PLUGIN_ROOT}/runtime/start-settings.sh",
+        "0.2.15"
+      ]
+    }
+  }
+}
