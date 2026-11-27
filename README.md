@@ -4,7 +4,7 @@
 
 ## 快速开始
 
-准备 macOS 或原生 Windows、Node.js 22.19 或更新版本（含 npm），以及已登录的 Codex CLI。设置弹窗和会话历史需要 Codex 桌面端。Windows 用户在 PowerShell 中确认 `node --version` 和 `codex --version` 可用。
+准备 macOS 或原生 Windows、Node.js 22.19 或更新版本（含 npm），以及已登录的 Codex CLI。设置弹窗和会话历史需要 Codex 桌面端。Windows 用户在 PowerShell 中确认 `node --version` 和 `codex --version` 可用。如果还没有 Codex CLI，可以用 `npm install -g @openai/codex` 安装，再运行 `codex login`。
 
 1. 在企业微信创建智能机器人，选择「API 模式 → 使用长连接」，取得 Bot ID 和 Secret。
 2. 在 GitHub 仓库打开 **Releases**，选择最新版本，下载 **Source code (zip)** 并解压。进入解压后的目录，运行以下命令，将示例路径替换成希望 Codex 使用的目录。

@@ -44,12 +44,8 @@ async function stop() {
       if (!/Boot-out failed: 3:/.test(error.stderr ?? '')) throw error;
     }
   }
-  if (isWindows) {
-    await waitForBridge(status => !status, '企微后台服务未能停止。');
-    return;
-  }
   for (let attempt = 0; attempt < 50; attempt++) {
-    if (!loaded()) return;
+    if (!loaded() && (!isWindows || !await readBridgeStatus())) return;
     await pause(300);
   }
   throw new Error('企微后台服务未能停止。');
