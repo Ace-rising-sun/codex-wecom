@@ -6,7 +6,7 @@ import { listHistory, openHistoryThread } from './history.mjs';
 import { efforts, memberAccessModes, personaLimit, personaStyles, readMemberAccess, readModelSettings,
   readPreferences, updateMemberAccess, updateModelSettings, updatePreferences } from './model-settings.mjs';
 
-const serverInfo = { name: 'wecom-settings', version: '0.2.15' };
+const serverInfo = { name: 'wecom-settings', version: '0.3.0' };
 const resourceUri = 'ui://wecom-codex/settings';
 const resource = { uri: resourceUri, name: '企微 Codex 设置', mimeType: 'text/html;profile=mcp-app' };
 const historyUri = 'ui://wecom-codex/history';

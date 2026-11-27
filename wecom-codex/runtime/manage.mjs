@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { chmod, cp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
@@ -7,7 +7,8 @@ import { Writable } from 'node:stream';
 import { text } from 'node:stream/consumers';
 import { setTimeout as pause } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { configFile, control, directory, label, plist, prepareDirectory, readJson, saveJson, stateFile } from './local.mjs';
+import { configFile, control, directory, isWindows, label, plist, prepareDirectory, readBridgeStatus, readJson, saveJson, stateFile } from './local.mjs';
+import { codexExecutable, installDependencies, runWindowsTask } from './platform.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const runtime = join(directory, 'package');
@@ -18,6 +19,7 @@ function launchctl(...args) {
 }
 
 function loaded() {
+  if (isWindows) return ['Running', 'Queued'].includes(runWindowsTask('state'));
   try {
     launchctl('print', `${domain}/${label}`);
     return true;
@@ -27,15 +29,31 @@ function loaded() {
 }
 
 function start() {
-  if (!loaded()) launchctl('bootstrap', domain, plist);
+  if (loaded()) return;
+  if (isWindows) runWindowsTask('start');
+  else launchctl('bootstrap', domain, plist);
+}
+
+async function stop() {
+  if (isWindows) {
+    if (loaded()) runWindowsTask('stop');
+  } else {
+    try {
+      launchctl('bootout', `${domain}/${label}`);
+    } catch (error) {
+      if (!/Boot-out failed: 3:/.test(error.stderr ?? '')) throw error;
+    }
+  }
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if (!loaded() && (!isWindows || !await readBridgeStatus())) return;
+    await pause(300);
+  }
+  throw new Error('企微后台服务未能停止。');
 }
 
 async function waitForBridge(accept, failure) {
   for (let attempt = 0; attempt < 50; attempt++) {
-    const status = await control('/status').catch(error => {
-      if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET'].includes(error.code)) return undefined;
-      throw error;
-    });
+    const status = await readBridgeStatus();
     if (accept(status)) return;
     await pause(300);
   }
@@ -43,7 +61,9 @@ async function waitForBridge(accept, failure) {
 }
 
 async function updateBridge() {
-  const files = (await Promise.all(['model-settings.mjs', 'codex.mjs', 'bridge.mjs'].map(async name => {
+  const names = ['local.mjs', 'model-settings.mjs', 'codex.mjs', 'bridge.mjs'];
+  if (isWindows) names.push('windows-service.mjs');
+  const files = (await Promise.all(names.map(async name => {
     const target = join(runtime, 'runtime', name);
     const [previous, next] = await Promise.all([readFile(target), readFile(join(root, 'runtime', name))]);
     return { target, temporary: `${target}.${randomUUID()}`, previous, next };
@@ -58,33 +78,21 @@ async function updateBridge() {
     }
   }
   const cleanStaging = () => Promise.all(files.map(file => rm(file.temporary, { force: true })));
-  async function stopBridge() {
-    try {
-      launchctl('bootout', `${domain}/${label}`);
-    } catch (error) {
-      if (!/Boot-out failed: 3:/.test(error.stderr ?? '')) throw error;
-    }
-    for (let attempt = 0; attempt < 50; attempt++) {
-      if (!loaded()) return;
-      await pause(300);
-    }
-    throw new Error('企微后台服务未能停止。');
-  }
   const waitForReady = () => waitForBridge(status => status?.connected && status.paired === initial.paired,
     '企微后台服务未能恢复连接或配对状态。');
 
   try {
-    await stopBridge();
+    await stop();
     await replace('next');
-    launchctl('bootstrap', domain, plist);
+    start();
     await waitForReady();
     console.log('企微后台服务已更新。');
   } catch (error) {
     try {
-      await stopBridge();
+      await stop();
       await cleanStaging();
       await replace('previous');
-      launchctl('bootstrap', domain, plist);
+      start();
       await waitForReady();
     } catch (restoreError) {
       throw new Error(`更新失败：${error.message} 旧后台服务未能恢复：${restoreError.message}`, { cause: error });
@@ -96,7 +104,7 @@ async function updateBridge() {
 }
 
 async function ask(defaultWorkspace) {
-  if (!process.stdin.isTTY) throw new Error('请在 Mac 终端运行 setup');
+  if (!process.stdin.isTTY) throw new Error('请在终端运行 setup');
   let hidden = false;
   const display = new Writable({
     write(chunk, _encoding, done) {
@@ -119,36 +127,11 @@ async function ask(defaultWorkspace) {
   }
 }
 
-function executable(name) {
-  return execFileSync('/usr/bin/which', [name], { encoding: 'utf8' }).trim();
-}
-
 function xml(value) {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-async function setup(input) {
-  if (process.platform !== 'darwin') throw new Error('此插件的后台服务需要 macOS');
-  if (loaded()) throw new Error('服务正在运行。重新配置前先执行 stop。');
-  if (!/^[\w-]{6,160}$/.test(input.botId ?? '') || !/^[\w-]{12,200}$/.test(input.secret ?? '')) {
-    throw new Error('请在企微机器人配置页核对 Bot ID 和 Secret');
-  }
-  const workspace = await realpath(input.workspace);
-  if (!(await stat(workspace)).isDirectory()) throw new Error('工作目录不存在');
-  const codex = executable('codex');
-  const npm = executable('npm');
-
-  await prepareDirectory();
-  await mkdir(runtime, { recursive: true, mode: 0o700 });
-  await Promise.all(['runtime', 'package.json', 'package-lock.json'].map(name =>
-    cp(join(root, name), join(runtime, name), { recursive: true })));
-  execFileSync(npm, ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'], {
-    cwd: runtime, stdio: ['ignore', 'ignore', 'pipe'],
-  });
-
-  const previous = await readJson(stateFile, {});
-  const paired = previous.botId === input.botId && previous.workspace === workspace && Boolean(previous.owner);
-  await saveJson(configFile, { botId: input.botId, secret: input.secret, workspace, codex });
+async function registerMacService() {
   await mkdir(dirname(plist), { recursive: true });
   const argumentsXml = [process.execPath, join(runtime, 'runtime', 'bridge.mjs')]
     .map(value => `<string>${xml(value)}</string>`).join('');
@@ -163,10 +146,35 @@ async function setup(input) {
 <key>StandardErrorPath</key><string>${xml(join(directory, 'bridge.log'))}</string>
 </dict></plist>\n`, { mode: 0o600 });
   await chmod(plist, 0o600);
+}
+
+async function setup(input) {
+  if (process.platform !== 'darwin' && !isWindows) throw new Error('此插件的后台服务支持 macOS 和 Windows');
+  if (loaded()) throw new Error('服务正在运行。重新配置前先执行 stop。');
+  if (!/^[\w-]{6,160}$/.test(input.botId ?? '') || !/^[\w-]{12,200}$/.test(input.secret ?? '')) {
+    throw new Error('请在企微机器人配置页核对 Bot ID 和 Secret');
+  }
+  const workspace = await realpath(input.workspace);
+  if (!(await stat(workspace)).isDirectory()) throw new Error('工作目录不存在');
+  const codex = codexExecutable();
+
+  await prepareDirectory();
+  await mkdir(runtime, { recursive: true, mode: 0o700 });
+  await Promise.all(['runtime', 'package.json', 'package-lock.json'].map(name =>
+    cp(join(root, name), join(runtime, name), { recursive: true })));
+  installDependencies(runtime);
+
+  const previous = await readJson(stateFile, {});
+  const paired = previous.botId === input.botId && previous.workspace === workspace && Boolean(previous.owner);
+  const config = { botId: input.botId, secret: input.secret, workspace, codex };
+  if (isWindows) config.controlKey = randomBytes(32).toString('hex');
+  if (isWindows) runWindowsTask('register', join(runtime, 'runtime', 'windows-service.mjs'));
+  else await registerMacService();
+  await saveJson(configFile, config);
   start();
   console.log('已启动企微连接服务。');
   if (!paired) {
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 60; attempt++) {
       try {
         const { command } = await control('/pair', {});
         console.log(command);
@@ -186,7 +194,7 @@ try {
     case 'setup': await setup(await ask(args[0] ?? process.cwd())); break;
     case 'configure-stdin': await setup(JSON.parse(await text(process.stdin))); break;
     case 'start': start(); break;
-    case 'stop': if (loaded()) launchctl('bootout', `${domain}/${label}`); break;
+    case 'stop': if (loaded()) await stop(); break;
     case 'update-bridge': await updateBridge(); break;
     case 'status': console.log(JSON.stringify(await control('/status'))); break;
     case 'pair': console.log((await control('/pair', {})).command); break;

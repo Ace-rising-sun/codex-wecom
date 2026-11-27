@@ -1,13 +1,17 @@
 import { createServer } from 'node:http';
-import { randomInt } from 'node:crypto';
+import { randomInt, timingSafeEqual } from 'node:crypto';
 import { chmod, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { WSClient, generateReqId } from '@wecom/aibot-node-sdk';
 import { Codex } from './codex.mjs';
-import { configFile, directory, prepareDirectory, readJson, saveJson, socket, stateFile } from './local.mjs';
+import { configFile, directory, isWindows, prepareDirectory, readJson, saveJson, socket, stateFile } from './local.mjs';
 import { memberAccessModes, personaStyles, readMemberAccess, readModelSettings, readPreferences } from './model-settings.mjs';
 
 const config = await readJson(configFile);
+if (isWindows && !/^[a-f0-9]{64}$/.test(config.controlKey ?? '')) {
+  throw new Error('Windows 后台缺少本机连接密钥。请重新运行安装程序。');
+}
+const controlAuthorization = isWindows ? Buffer.from(`Bearer ${config.controlKey}`) : undefined;
 const previous = await readJson(stateFile, {});
 const state = previous.botId === config.botId && previous.workspace === config.workspace
   ? previous : { botId: config.botId, workspace: config.workspace, seen: [], notices: [] };
@@ -457,8 +461,15 @@ async function handleRequest(req) {
 }
 
 await prepareDirectory();
-await rm(socket, { force: true });
+if (!isWindows) await rm(socket, { force: true });
 const control = createServer((req, res) => {
+  if (controlAuthorization) {
+    const provided = Buffer.from(req.headers.authorization ?? '');
+    if (provided.length !== controlAuthorization.length || !timingSafeEqual(provided, controlAuthorization)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: '本机连接未授权' }));
+      return;
+    }
+  }
   handleRequest(req).then(reply => {
     res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
   }).catch(error => {
@@ -466,7 +477,7 @@ const control = createServer((req, res) => {
   });
 });
 await new Promise((resolve, reject) => control.once('error', reject).listen(socket, resolve));
-await chmod(socket, 0o600);
+if (!isWindows) await chmod(socket, 0o600);
 client.connect();
 process.on('SIGTERM', () => {
   client.disconnect();
