@@ -5,7 +5,7 @@ description: Configure WeCom Codex in the desktop plugin settings, or manage the
 
 # Configure WeCom Codex
 
-The desktop path is Settings → Plugins → 企微 Codex → Settings. Select Open settings (打开设置) to configure the model, access and robot in a dialog over the plugin details. Close the dialog to return to the details. Enter the robot Secret in the form's password field. If the user explicitly asks to open the form in chat and `wecom.settings.open` from `wecom-settings` is available, call it with `{}`. The terminal steps below support bridge management.
+The desktop path is Settings → Plugins → 企微 Codex → Settings. Select Open settings (打开设置) to configure the model, task time limit, access and robot in a dialog over the plugin details. Close the dialog to return to the details. Enter the robot Secret in the form's password field. If the user explicitly asks to open the form in chat and `wecom.settings.open` from `wecom-settings` is available, call it with `{}`. The terminal steps below support bridge management.
 
 Use `runtime/manage.mjs` two directories above this skill. Run `node <absolute path to manage.mjs> status` first. If the bridge is already online and paired, report that status. If it is waiting for pairing, display the temporary pairing command from `manage.mjs pair`.
 

@@ -49,12 +49,12 @@ export class Codex {
     });
 
     this.ready = this.request('initialize', {
-      clientInfo: { name: 'wecom_codex_local', title: 'WeCom Codex Local', version: '0.3.0' },
+      clientInfo: { name: 'wecom_codex_local', title: 'WeCom Codex Local', version: '0.4.0' },
       capabilities: { experimentalApi: true },
     }).then(() => this.#write({ method: 'initialized' }));
   }
 
-  request(method, params) {
+  request(method, params, timeout = 15_000) {
     return new Promise((resolve, reject) => {
       const id = this.#nextId++;
       const settle = callback => value => {
@@ -62,7 +62,9 @@ export class Codex {
         this.#pending.delete(id);
         callback(value);
       };
-      const timer = setTimeout(() => this.#pending.get(id)?.reject(new Error(`${method} 超时`)), 15_000);
+      const timer = timeout > 0
+        ? setTimeout(() => this.#pending.get(id)?.reject(new Error(`${method} 超时`)), timeout)
+        : undefined;
       this.#pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
       try {
         this.#write({ id, method, params });

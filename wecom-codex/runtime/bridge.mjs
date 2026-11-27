@@ -21,9 +21,13 @@ let connected = false;
 let pairing;
 let codex;
 const loadedThreads = new Set();
-let active;
-let queue = Promise.resolve();
-let waiting = 0;
+const concurrentTasks = 2;
+const waitingLimit = 4;
+const running = new Map();
+const waiting = [];
+const admissions = new Map();
+const runsByThread = new Map();
+const approvals = new Map();
 let writing = Promise.resolve();
 const limit = 20 * 1024 * 1024;
 const approvalMethods = new Set([
@@ -121,65 +125,97 @@ async function handlePair(frame, code) {
   await reply(frame, '配对成功。发 /ping 检查连接，也可以直接发任务给 Codex。');
 }
 
-function answerApproval(pending, accept) {
+function clearApproval(run, pending) {
+  if (run.approval !== pending) return false;
   clearTimeout(pending.timer);
-  if (active) active.approval = undefined;
+  approvals.delete(pending.code);
+  run.approval = undefined;
+  return true;
+}
+
+function answerApproval(run, pending, accept) {
+  if (!clearApproval(run, pending)) return false;
   const answer = pending.method === 'item/permissions/requestApproval'
     ? { permissions: accept ? pending.permissions ?? {} : {}, scope: 'turn' }
     : { decision: accept ? 'accept' : 'decline' };
-  codex?.respond(pending.id, answer);
+  run.app.respond(pending.id, answer);
+  return true;
 }
 
-function onCodexEvent({ id, method, params }) {
-  const run = active;
+function finishRun(run, status) {
+  if (run.finished) return;
+  run.finished = true;
+  clearTimeout(run.timer);
+  if (run.approval) clearApproval(run, run.approval);
+  run.done.resolve(status);
+}
+
+function onCodexEvent(app, { id, method, params }) {
+  const run = runsByThread.get(params?.threadId);
+  const eventTurn = params?.turn?.id ?? params?.turnId;
+  const matches = run?.app === app && !run.finished && (!run.turnId || !eventTurn || run.turnId === eventTurn);
   if (id !== undefined) {
     if (!approvalMethods.has(method)) {
-      if (method === 'item/tool/requestUserInput') codex?.respond(id, { answers: {} });
-      else if (method === 'mcpServer/elicitation/request') codex?.respond(id, { action: 'decline', content: null });
-      else codex?.reject(id);
+      if (method === 'item/tool/requestUserInput') app.respond(id, { answers: {} });
+      else if (method === 'mcpServer/elicitation/request') app.respond(id, { action: 'decline', content: null });
+      else app.reject(id);
       return;
     }
-    if (!run || params.threadId !== run.threadId || run.approval) {
-      codex?.respond(id, method === 'item/permissions/requestApproval'
+    if (!matches || run.approval || run.stopReason) {
+      app.respond(id, method === 'item/permissions/requestApproval'
         ? { permissions: {}, scope: 'turn' } : { decision: 'decline' });
       return;
     }
-    const code = String(randomInt(100_000, 1_000_000));
-    const pending = { id, method, code, permissions: params.permissions };
+    let code;
+    do {
+      code = String(randomInt(100_000, 1_000_000));
+    } while (approvals.has(code));
+    const pending = { id, method, code, permissions: params.permissions, run };
     const decline = () => {
-      if (active?.approval === pending) answerApproval(pending, false);
+      try {
+        answerApproval(run, pending, false);
+      } catch {
+        console.error('未能拒绝已过期的企微权限请求');
+      }
     };
     pending.timer = setTimeout(decline, 90_000);
     run.approval = pending;
+    approvals.set(code, pending);
     const detail = bounded(params.command ?? params.reason ?? '请确认 Codex 请求的一次性权限。', 1000);
-    void mayContinue(run.conversation, run.sender).then(allowed => {
-      if (active?.approval !== pending) return;
+    const context = run.job.group ? '群聊任务' : '私聊任务';
+    const task = noticePreview(run.taskPreview);
+    void mayContinue(run.job.conversation, run.job.sender).then(allowed => {
+      if (run.approval !== pending) return;
       if (!allowed) return decline();
-      return notify(`Codex 等待批准\n${detail}\n\n回复 /approve ${code} 或 /reject ${code}，90 秒内有效。`);
+      return notify(`Codex 等待批准 · ${context}${task ? `\n任务　${task}` : ''}\n${detail}\n\n回复 /approve ${code} 或 /reject ${code}，90 秒内有效。`);
     }).catch(decline);
     return;
   }
-  if (!run || params?.threadId !== run.threadId) return;
-  const eventTurn = params.turn?.id ?? params.turnId;
-  if (run.turnId && eventTurn && run.turnId !== eventTurn) return;
-  if (method === 'turn/started') run.turnId = eventTurn;
+  if (!matches) return;
+  if (method === 'turn/started') beginRun(run, eventTurn);
   if (method === 'item/completed' && params.item.type === 'agentMessage' && params.item.phase !== 'commentary') {
     run.answer = params.item.text;
   }
-  if (method === 'turn/completed') run.done.resolve(params.turn.status);
+  if (method === 'turn/completed') finishRun(run, params.turn.status);
 }
 
 async function ensureCodex() {
   if (!codex) {
-    codex = new Codex({
-      executable: config.codex, directory: config.workspace, onEvent: onCodexEvent,
-      onExit(instance) {
-        if (codex !== instance) return;
+    const instance = new Codex({
+      executable: config.codex, directory: config.workspace,
+      onEvent(event) {
+        if (codex === instance) onCodexEvent(instance, event);
+      },
+      onExit(app) {
+        if (codex !== app) return;
         codex = undefined;
         loadedThreads.clear();
-        active?.done.resolve('failed');
+        for (const run of runsByThread.values()) {
+          if (run.app === app) finishRun(run, 'failed');
+        }
       },
     });
+    codex = instance;
   }
   const instance = codex;
   try {
@@ -191,9 +227,38 @@ async function ensureCodex() {
   }
 }
 
-async function interrupt(run) {
-  if (run.approval) answerApproval(run.approval, false);
-  if (run.turnId) await codex.request('turn/interrupt', { threadId: run.threadId, turnId: run.turnId });
+async function sendInterrupt(run) {
+  if (run.finished) return;
+  try {
+    if (run.approval) answerApproval(run, run.approval, false);
+    await run.app.request('turn/interrupt', { threadId: run.threadId, turnId: run.turnId });
+  } catch (error) {
+    if (run.finished) return;
+    run.stopReason = undefined;
+    throw error;
+  }
+}
+
+async function interrupt(run, reason = 'manual') {
+  if (run.finished || run.stopReason) return;
+  run.stopReason = reason;
+  if (run.turnId) await sendInterrupt(run);
+}
+
+function beginRun(run, turnId) {
+  if (!turnId || run.turnId || run.finished) return;
+  run.turnId = turnId;
+  if (run.stopReason) {
+    void sendInterrupt(run).catch(() => console.error('未能停止企微任务'));
+    return;
+  }
+  if (run.timeoutMinutes > 0) {
+    run.timer = setTimeout(() => {
+      void interrupt(run, 'timeout').catch(async () => {
+        if (!run.finished) await publish(run.job, `本轮达到 ${run.timeoutMinutes} 分钟执行时限，暂未确认停止。`);
+      }).catch(() => console.error('未能发送执行时限提示'));
+    }, run.timeoutMinutes * 60_000);
+  }
 }
 
 function withoutMention(text) {
@@ -231,8 +296,10 @@ async function codexInput(frame, cleanText) {
   return items;
 }
 
-async function runTask(conversation, sender, items, messageId) {
-  const [{ model, reasoningEffort: effort }, { persona }] = await Promise.all([readModelSettings(), readPreferences()]);
+async function runTask(job, items) {
+  const { conversation, sender, messageId } = job;
+  const [{ model, reasoningEffort: effort }, { persona, taskTimeoutMinutes }] =
+    await Promise.all([readModelSettings(), readPreferences()]);
   const instruction = persona.style === 'custom' ? persona.instructions : personaStyles[persona.style].instruction;
   const additionalContext = {
     'wecom-codex-persona': {
@@ -252,37 +319,78 @@ async function runTask(conversation, sender, items, messageId) {
     await app.request('thread/resume', {
       threadId, model, excludeTurns: true, sandbox: 'read-only', approvalPolicy: 'on-request',
     });
-    loadedThreads.add(threadId);
+    if (app === codex) loadedThreads.add(threadId);
   }
 
   if (!await mayContinue(conversation, sender)) return;
-  const run = { conversation, sender, threadId, done: Promise.withResolvers() };
-  active = run;
-  const timer = setTimeout(() => {
-    void interrupt(run).catch(() => {}).finally(() => run.done.resolve('timed-out'));
-  }, 180_000);
+  if (app !== codex || runsByThread.has(threadId)) throw new Error('Codex 会话暂时不可用');
+  const run = {
+    job, app, threadId, timeoutMinutes: taskTimeoutMinutes, done: Promise.withResolvers(),
+    taskPreview: items.find(item => item.type === 'text')?.text,
+  };
+  job.run = run;
+  runsByThread.set(threadId, run);
   try {
-    const started = await app.request('turn/start', {
-      threadId: run.threadId, input: items, model, effort, clientUserMessageId: messageId, additionalContext,
-    })
-      .catch(error => { app.close(); throw error; });
-    run.turnId ??= started.turn.id;
+    // Once a turn is submitted, only that turn's completion, interruption, or server exit ends it.
+    const started = app.request('turn/start', {
+      threadId, input: items, model, effort, clientUserMessageId: messageId, additionalContext,
+    }, 0).then(result => beginRun(run, result.turn.id));
+    await Promise.race([started, run.done.promise]);
     const status = await run.done.promise;
-    if (status === 'timed-out') app.close();
-    // Codex materializes the thread's history during the first turn.
     if (!conversation.thread && status === 'completed' && await mayContinue(conversation, sender)) {
       conversation.thread = threadId;
-      loadedThreads.add(threadId);
+      if (app === codex) loadedThreads.add(threadId);
       await save();
     }
     if (status === 'completed') return run.answer || '本轮已完成。';
-    if (status === 'interrupted') return '任务已停止。';
-    if (status === 'timed-out') return '任务超时，已结束本轮。';
+    if (status === 'interrupted') return run.stopReason === 'timeout'
+      ? `本轮达到设置的 ${run.timeoutMinutes} 分钟执行时限，已停止。` : '任务已停止。';
     return 'Codex 本轮执行失败。';
   } finally {
-    clearTimeout(timer);
-    if (run.approval) clearTimeout(run.approval.timer);
-    active = undefined;
+    finishRun(run, 'failed');
+    runsByThread.delete(threadId);
+  }
+}
+
+async function publish(job, result) {
+  if (await mayContinue(job.conversation, job.sender)) await notify(result, job.group?.chatId ?? job.sender);
+}
+
+async function executeJob(job) {
+  const { conversation, sender, group, frame, text } = job;
+  if (!await mayContinue(conversation, sender)) return;
+  if (text === '/new') {
+    loadedThreads.delete(conversation.thread);
+    delete conversation.thread;
+    await save();
+    const result = '下条消息将从新会话开始。';
+    return group ? publish(job, result) : reply(frame, result);
+  }
+  await job.groupAck;
+  const items = await codexInput(frame, group && frame.body.text ? text : undefined);
+  if (!items.length) {
+    const result = '请发送文字、截图或附件。';
+    return group ? publish(job, result) : reply(frame, result);
+  }
+  if (!await mayContinue(conversation, sender)) return;
+  if (!group) await reply(frame, '已接收，Codex 正在处理。');
+  const result = await runTask(job, items);
+  if (result !== undefined) await publish(job, result).catch(() => console.error('企微任务结果发送失败'));
+}
+
+function dispatchJobs() {
+  while (running.size < concurrentTasks) {
+    const index = waiting.findIndex(job => !running.has(job.key));
+    if (index < 0) return;
+    const [job] = waiting.splice(index, 1);
+    running.set(job.key, job);
+    void executeJob(job).catch(async error => {
+      console.error(`处理任务失败：${error.name}`);
+      await publish(job, '这次任务未能完成，可以发送 /status 检查连接。').catch(() => {});
+    }).finally(() => {
+      running.delete(job.key);
+      dispatchJobs();
+    });
   }
 }
 
@@ -299,7 +407,7 @@ async function sendFile(path) {
   await client.sendMediaMessage(state.owner, 'file', uploaded.media_id);
 }
 
-async function receive(frame) {
+async function receive(frame, key) {
   const message = frame.body;
   if (typeof message?.from?.userid !== 'string' || !message.from.userid
     || typeof message.msgid !== 'string' || !message.msgid) return;
@@ -328,9 +436,11 @@ async function receive(frame) {
     if (group) {
       state.groups.splice(state.groups.indexOf(group), 1);
       loadedThreads.delete(group.thread);
-      if (active?.conversation === group) {
-        void interrupt(active).catch(() => console.error('未能停止已关闭群聊的任务'));
+      for (let i = waiting.length - 1; i >= 0; i--) {
+        if (waiting[i].key === key) waiting.splice(i, 1);
       }
+      const run = running.get(key)?.run;
+      if (run) void interrupt(run).catch(() => console.error('未能停止已关闭群聊的任务'));
     }
     await save();
     return reply(frame, '本群已关闭企微 Codex。');
@@ -343,17 +453,17 @@ async function receive(frame) {
 
   let conversation = group ?? (isOwner ? state : state.direct.find(item => item.userId === sender));
   if (text === '/ping') return reply(frame, 'pong · 企微 Codex 在线');
+  const activeJob = running.get(key);
   if (text === '/status') {
-    if (group) return reply(frame, active?.conversation === group ? '本群有 Codex 任务正在运行。' : '本群当前没有运行中的 Codex 任务。');
-    if (!isOwner) return reply(frame, active?.conversation === conversation && active?.sender === sender
-      ? '你的 Codex 任务正在运行。' : '你当前没有运行中的 Codex 任务。');
-    return reply(frame, `Codex ${active ? '正在运行' : '空闲'}，等待任务 ${waiting} 个。`);
+    const queued = waiting.filter(job => job.key === key).length;
+    const summary = `${activeJob ? '本会话正在运行' : '本会话空闲'}，等待任务 ${queued} 个。`;
+    return reply(frame, !group && isOwner
+      ? `${summary}全部企微会话运行中 ${running.size} 个，等待 ${waiting.length} 个。` : summary);
   }
   if (text === '/stop') {
-    const run = active;
-    if (!run?.turnId || (group && run.conversation !== conversation)
-      || (!isOwner && (run.sender !== sender || run.conversation !== conversation))) {
-      return reply(frame, '当前没有运行中的任务。');
+    const run = activeJob?.run;
+    if (!run || run.finished || (!isOwner && activeJob.sender !== sender)) {
+      return reply(frame, '当前没有可停止的运行中任务。');
     }
     await interrupt(run);
     return reply(frame, '已请求停止当前任务。');
@@ -361,12 +471,11 @@ async function receive(frame) {
   const decision = /^\/(approve|reject) (\d{6})$/.exec(text);
   if (decision) {
     if (group || !isOwner) return reply(frame, '权限审批请由配对账号在机器人私聊中处理。');
-    const run = active;
-    const pending = run?.approval;
-    if (pending?.code !== decision[2]) return reply(frame, '审批请求不存在或已过期。');
-    const accept = decision[1] === 'approve' && await mayContinue(run.conversation, run.sender);
-    if (active?.approval !== pending) return reply(frame, '审批请求不存在或已过期。');
-    answerApproval(pending, accept);
+    const pending = approvals.get(decision[2]);
+    if (!pending) return reply(frame, '审批请求不存在或已过期。');
+    const { run } = pending;
+    const accept = decision[1] === 'approve' && await mayContinue(run.job.conversation, run.job.sender);
+    if (!answerApproval(run, pending, accept)) return reply(frame, '审批请求不存在或已过期。');
     return reply(frame, '已记录一次性审批。');
   }
   if (!group && isOwner && text.startsWith('/file ')) {
@@ -377,54 +486,37 @@ async function receive(frame) {
     return reply(frame, group ? '本群支持 /ping、/status、/new、/stop 和 /group-off。'
       : isOwner ? '支持 /ping、/status、/new、/stop 和 /file 相对路径。' : '支持 /ping、/status、/new 和 /stop。');
   }
-  if (waiting >= 4) return reply(frame, '等待队列已满，请稍后再发。');
+  if (waiting.length >= waitingLimit && (running.size >= concurrentTasks || activeJob)) {
+    return reply(frame, '等待队列已满，请稍后再发。');
+  }
   if (!conversation) {
     conversation = { userId: sender };
     state.direct.push(conversation);
   }
-  const publish = async result => {
-    if (await mayContinue(conversation, sender)) await notify(result, group?.chatId ?? sender);
-  };
-  waiting++;
   const groupAck = group && text !== '/new'
-    ? reply(frame, '已接收，Codex 将按顺序处理。').catch(() => console.error('企微群聊确认回复失败'))
+    ? reply(frame, '已接收，本会话按顺序处理。').catch(() => console.error('企微群聊确认回复失败'))
     : undefined;
-  queue = queue.then(async () => {
-    waiting--;
-    if (!await mayContinue(conversation, sender)) return;
-    if (text === '/new') {
-      loadedThreads.delete(conversation.thread);
-      delete conversation.thread;
-      await save();
-      const result = '下条消息将从新会话开始。';
-      if (group) await publish(result);
-      else await reply(frame, result);
-      return;
-    }
-    await groupAck;
-    const items = await codexInput(frame, group && message.text ? text : undefined);
-    if (!items.length) {
-      const result = '请发送文字、截图或附件。';
-      return group ? publish(result) : reply(frame, result);
-    }
-    if (!await mayContinue(conversation, sender)) return;
-    if (!group) await reply(frame, '已接收，Codex 正在处理。');
-    const result = await runTask(conversation, sender, items, message.msgid);
-    if (result !== undefined) {
-      await publish(result).catch(() => console.error('企微任务结果发送失败'));
-    }
-  }).catch(async error => {
-    console.error(`处理任务失败：${error.name}`);
-    await publish('这次任务未能完成，可以发送 /status 检查连接。').catch(() => {});
-  });
+  waiting.push({ key, conversation, sender, messageId: message.msgid, group, frame, text, groupAck });
+  dispatchJobs();
 }
+
 client.on('message', frame => {
-  void receive(frame).catch(() => console.error('未能处理企微消息'));
+  const message = frame?.body;
+  const isGroup = message?.chattype === 'group';
+  const id = isGroup ? message.chatid : message?.from?.userid;
+  if (typeof id !== 'string' || !id) return;
+  const key = `${isGroup ? 'group' : 'private'}:${id}`;
+  const admission = (admissions.get(key) ?? Promise.resolve()).then(() => receive(frame, key))
+    .catch(() => console.error('未能处理企微消息'));
+  admissions.set(key, admission);
+  void admission.finally(() => {
+    if (admissions.get(key) === admission) admissions.delete(key);
+  });
 });
 
 async function handleRequest(req) {
   if (req.method === 'GET' && req.url === '/status') {
-    return { connected, paired: Boolean(state.owner), active: Boolean(active), waiting };
+    return { connected, paired: Boolean(state.owner), active: running.size > 0, waiting: waiting.length };
   }
   if (req.method !== 'POST') throw new Error('请求不受支持');
   let body = '';
@@ -446,7 +538,7 @@ async function handleRequest(req) {
   }
   if (req.url === '/hook') {
     if (!state.owner || !connected || input.hook_event_name !== 'Stop' || input.stop_hook_active
-      || !input.turn_id || !input.session_id || input.session_id === state.thread || input.session_id === active?.threadId
+      || !input.turn_id || !input.session_id || input.session_id === state.thread || runsByThread.has(input.session_id)
       || state.groups.some(group => group.thread === input.session_id)
       || state.direct.some(direct => direct.thread === input.session_id) || typeof input.cwd !== 'string') return {};
     const cwd = await realpath(input.cwd).catch(() => undefined);
