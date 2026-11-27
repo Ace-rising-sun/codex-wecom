@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
+import { windowsPowerShell } from './platform.mjs';
 
 const originator = 'wecom_codex_local';
 const threadIdPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
@@ -71,7 +72,13 @@ export async function openHistoryThread(id, directory = defaultDirectory(), laun
   }
   if (!thread) throw new Error('这条企微会话已不在本机历史中，请重新打开列表。');
   try {
-    await launch('/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${thread.id}`], { timeout: 5_000 });
+    const url = `codex://threads/${thread.id}`;
+    if (process.platform === 'win32') {
+      await launch(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-Command', `Start-Process '${url}'`],
+        { timeout: 5_000, windowsHide: true });
+    } else {
+      await launch('/usr/bin/open', ['-b', 'com.openai.codex', url], { timeout: 5_000 });
+    }
   } catch {
     throw new Error('无法打开 Codex 会话，请确认桌面端已安装。');
   }

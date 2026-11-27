@@ -10,9 +10,12 @@ export class Codex {
     const childEnv = { ...process.env };
     delete childEnv.WECOM_BOT_ID;
     delete childEnv.WECOM_BOT_SECRET;
-    const child = spawn(executable, ['app-server', '--listen', 'stdio://'], {
+    const args = ['app-server', '--listen', 'stdio://'];
+    const script = executable.endsWith('.cjs');
+    const child = spawn(script ? process.execPath : executable, script ? [executable, ...args] : args, {
       cwd: directory,
       env: childEnv,
+      windowsHide: true,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     this.#child = child;
@@ -46,7 +49,7 @@ export class Codex {
     });
 
     this.ready = this.request('initialize', {
-      clientInfo: { name: 'wecom_codex_local', title: 'WeCom Codex Local', version: '0.2.15' },
+      clientInfo: { name: 'wecom_codex_local', title: 'WeCom Codex Local', version: '0.3.0' },
       capabilities: { experimentalApi: true },
     }).then(() => this.#write({ method: 'initialized' }));
   }

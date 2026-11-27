@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { windowsPowerShell } from '../wecom-codex/runtime/platform.mjs';
 import { listHistory, openHistoryThread } from '../wecom-codex/runtime/history.mjs';
 
 test('history includes older and archived WeCom chats and opens only matching local chats', async t => {
@@ -42,7 +43,11 @@ test('history includes older and archived WeCom chats and opens only matching lo
   const opens = [];
   const launch = (...args) => opens.push(args);
   assert.deepEqual(await openHistoryThread(id(1), directory, launch), { opened: true });
-  assert.deepEqual(opens, [['/usr/bin/open', ['-b', 'com.openai.codex', `codex://threads/${id(1)}`], { timeout: 5_000 }]]);
+  const url = `codex://threads/${id(1)}`;
+  assert.deepEqual(opens, [process.platform === 'win32'
+    ? [windowsPowerShell, ['-NoProfile', '-NonInteractive', '-Command', `Start-Process '${url}'`],
+      { timeout: 5_000, windowsHide: true }]
+    : ['/usr/bin/open', ['-b', 'com.openai.codex', url], { timeout: 5_000 }]]);
   await assert.rejects(openHistoryThread(id(40), directory, launch), /不在本机历史/);
   await assert.rejects(openHistoryThread('new?prompt=unrelated', directory, launch), /无效/);
   assert.equal(opens.length, 1);

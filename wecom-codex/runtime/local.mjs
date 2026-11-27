@@ -1,13 +1,19 @@
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { request } from 'node:http';
 
-export const directory = join(homedir(), 'Library', 'Application Support', 'WeCom Codex');
+export const isWindows = process.platform === 'win32';
+export const dataParent = isWindows
+  ? process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
+  : join(homedir(), 'Library', 'Application Support');
+export const directory = join(dataParent, 'WeCom Codex');
 export const configFile = join(directory, 'config.json');
 export const stateFile = join(directory, 'state.json');
-export const socket = join(directory, 'control.sock');
+export const socket = isWindows
+  ? '\\\\.\\pipe\\wecom-codex-' + createHash('sha256').update(directory.toLowerCase()).digest('hex').slice(0, 32)
+  : join(directory, 'control.sock');
 export const label = 'local.wecom-codex';
 export const plist = join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
 
@@ -22,7 +28,7 @@ export async function readJson(path, fallback) {
 
 export async function prepareDirectory() {
   await mkdir(directory, { mode: 0o700, recursive: true });
-  await chmod(directory, 0o700);
+  if (!isWindows) await chmod(directory, 0o700);
 }
 
 export async function saveJson(path, data) {
@@ -31,10 +37,15 @@ export async function saveJson(path, data) {
   await rename(temporary, path);
 }
 
-export function control(path, data) {
+export async function control(path, data, timeout = 20_000) {
+  const headers = {};
+  if (isWindows) {
+    const { controlKey } = await readJson(configFile);
+    headers.Authorization = `Bearer ${controlKey}`;
+  }
   return new Promise((resolve, reject) => {
     const body = data === undefined ? undefined : JSON.stringify(data);
-    const req = request({ socketPath: socket, path, method: body ? 'POST' : 'GET' }, res => {
+    const req = request({ socketPath: socket, path, method: body ? 'POST' : 'GET', headers }, res => {
       let reply = '';
       res.setEncoding('utf8').on('data', part => { reply += part; });
       res.once('end', () => {
@@ -47,8 +58,17 @@ export function control(path, data) {
         }
       });
     });
-    req.setTimeout(20_000, () => req.destroy(new Error('本地服务请求超时')));
+    req.setTimeout(timeout, () => req.destroy(new Error('本地服务请求超时')));
     req.once('error', reject);
     req.end(body);
   });
+}
+
+export async function readBridgeStatus() {
+  try {
+    return await control('/status');
+  } catch (error) {
+    if (['ENOENT', 'ECONNREFUSED', 'ECONNRESET'].includes(error.code)) return undefined;
+    throw error;
+  }
 }
